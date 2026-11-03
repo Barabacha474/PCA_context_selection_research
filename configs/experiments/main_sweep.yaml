@@ -1,3 +1,5 @@
+reference_method: random
+
 data:
   pool_path: data/pools/primary.parquet
   ood_pool_path: data/pools/ood.parquet
@@ -9,15 +11,15 @@ encoders:
 
 selectors:
   - name: random
-    params: {seed: 0}
+    params: {}
   - name: relevance
     params: {}
   - name: mmr
     params: {lambda_: 0.7}
   - name: mmr_dynamic
-    params: {lambda_: 0.7, seed: 0}
+    params: {lambda_: 0.7}
   - name: fps
-    params: {metric: euclidean, seed: 0}
+    params: {metric: euclidean}
   - name: static_pca
     params: {k: 5}
   - name: iterative_pca

@@ -1,71 +1,66 @@
-"""Minimal end-to-end sweep: encoder -> tokenizer -> selector -> metrics.
+"""CLI wrapper for the selection sweep.
 
-This is the walking-skeleton entry point. It uses only offline
-components (HashingEncoder, RegexTokenizer) so it runs without network
-access or model downloads. The real sweep will grow config
-loading around this, but the pipeline shape -- the order of calls and
-the boundary between the components -- is already final here.
+Thin on purpose: argument parsing only. All work is in
+:func:`pcadiv.sweep.run_sweep`, exercised by tests directly.
 
-Run from the project root:
+Usage::
 
-    python experiments/run_selection_sweep.py
+    python experiments/run_selection_sweep.py \
+        --config configs/experiments/main_sweep.yaml
+
+    # debug on a small pool, override pool path and sweep name
+    python experiments/run_selection_sweep.py \
+        --config configs/experiments/main_sweep.yaml \
+        --pool data/pools/primary_debug.parquet \
+        --sweep-name debug
+
+    # debug with tiny encoders via YAML overrides
+    python experiments/run_selection_sweep.py \
+        --config configs/experiments/main_sweep.yaml \
+        --override encoders.selection=configs/embed/selection_encoder.yaml \
+        --sweep-name debug
 """
 from __future__ import annotations
 
-import numpy as np
+import argparse
 
-from pcadiv.data.tokenizer import get_tokenizer
-from pcadiv.embeddings.encoders import get_encoder
-from pcadiv.evaluation import budget_curve, get_metric
-from pcadiv.selection import get_selector
+from pcadiv.sweep import run_sweep
+from pcadiv.utils.config import load_config
 from pcadiv.utils.logging import configure, get_logger
-
-
-def _synthetic_passages(n: int, vocab_size: int, seed: int) -> list[str]:
-    """Generate ``n`` synthetic passages as word sequences."""
-    rng = np.random.default_rng(seed)
-    vocab = [f"w{i}" for i in range(vocab_size)]
-    passages: list[str] = []
-    for _ in range(n):
-        length = int(rng.integers(20, 120))
-        tokens = rng.choice(vocab, size=length).tolist()
-        passages.append(" ".join(tokens))
-    return passages
 
 
 def main() -> None:
     configure()
     log = get_logger("run_selection_sweep")
 
-    texts = _synthetic_passages(n=200, vocab_size=500, seed=0)
-    log.info("generated %d synthetic passages", len(texts))
-
-    encoder = get_encoder("hashing", dim=128)
-    tokenizer = get_tokenizer("regex")
-
-    pool_emb = encoder.encode(texts)
-    pool_tokens = tokenizer.count_many(texts)
-    log.info(
-        "pool_emb shape=%s, pool_tokens total=%d, min=%d, max=%d",
-        pool_emb.shape, int(pool_tokens.sum()),
-        int(pool_tokens.min()), int(pool_tokens.max()),
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="configs/experiments/main_sweep.yaml")
+    p.add_argument(
+        "--override", action="append", default=[],
+        help="dot-path override, e.g. budgets='[512]'",
     )
-
-    selector = get_selector("random", seed=0)
-    result = selector.select(pool_emb, pool_tokens, budget=500)
-    log.info(
-        "selected %d / %d passages, %d / 500 tokens",
-        len(result), len(texts), result.total_tokens,
+    p.add_argument(
+        "--pool", default=None,
+        help="override data.pool_path (debug on a smaller pool)",
     )
+    p.add_argument(
+        "--sweep-name", default=None,
+        help="override cfg['sweep_name'] (used as output file stem)",
+    )
+    p.add_argument(
+        "--out-dir", default=None,
+        help="override cfg['output_dir']",
+    )
+    args = p.parse_args()
 
-    metrics = [get_metric("mean_pairwise")]
-    df = budget_curve(result, pool_emb, metrics)
-    log.info("budget_curve rows=%d, columns=%s", len(df), list(df.columns))
-
-    print("\n--- head ---")
-    print(df.head(3).to_string(index=False))
-    print("\n--- tail ---")
-    print(df.tail(3).to_string(index=False))
+    cfg = load_config(args.config, args.override)
+    out = run_sweep(
+        cfg,
+        out_dir=args.out_dir,
+        sweep_name=args.sweep_name,
+        pool_override=args.pool,
+    )
+    log.info("done: %s", out)
 
 
 if __name__ == "__main__":
