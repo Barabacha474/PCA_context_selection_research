@@ -654,3 +654,173 @@ class DynamicMMRSelector(BaseSelector):
             "warmup": warmup,
         }
         return selected, meta
+
+# ---------------------------------------------------------------------
+# Distance helper (FPS-local, to keep selection/ free of evaluation/)
+# ---------------------------------------------------------------------
+
+def _distance_to_point(
+    X: np.ndarray, point: np.ndarray, metric: str
+) -> np.ndarray:
+    """Distance from each row of ``X`` to a single ``point`` (1-D).
+
+    ``metric`` is ``"euclidean"`` or ``"cosine"``. Cosine follows the
+    same convention as ``evaluation.metrics``: a zero-norm row or a
+    zero-norm point has distance ``1.0`` (maximally dissimilar) rather
+    than ``NaN``.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    p = np.asarray(point, dtype=np.float64)
+
+    if metric == "euclidean":
+        diff = X - p
+        return np.sqrt(np.einsum("ij,ij->i", diff, diff))
+
+    if metric == "cosine":
+        x_norms = np.linalg.norm(X, axis=1)
+        p_norm = float(np.linalg.norm(p))
+        denom = x_norms * p_norm
+        safe = np.where(denom > 0, denom, 1.0)
+        sim = (X @ p) / safe
+        np.clip(sim, -1.0, 1.0, out=sim)
+        dist = 1.0 - sim
+        return np.where(denom > 0, dist, 1.0)
+
+    raise ValueError(f"unknown metric {metric!r}; supported: 'euclidean', 'cosine'")
+
+
+# ---------------------------------------------------------------------
+# FPSSelector
+# ---------------------------------------------------------------------
+
+@register_selector
+class FPSSelector(BaseSelector):
+    """Farthest Point Sampling.
+
+    At each step, choose the candidate whose **distance to the nearest
+    already-selected point is largest**. This is the greedy
+    ``min-distance`` counterpart of MMR's ``λ=0`` mode, with one crucial
+    difference: MMR uses *similarity* (cosine) while FPS uses an
+    arbitrary distance metric, configurable as ``euclidean`` or
+    ``cosine``. Euclidean is the convention in the FPS literature; on
+    L2-normalised embeddings the two orderings differ only mildly, but
+    on unnormalised embeddings they can diverge substantially.
+
+    Relationship to IterativePCASelector
+    ------------------------------------
+    FPS and iterative PCA are **not** the same method dressed
+    differently: FPS ranks candidates by ``min_{s∈S} d(x, s)`` (nearest
+    neighbour in ``S``), while PCA ranks them by
+    ``||x - U_k U_kᵀ x||`` (residual outside the subspace spanned by
+    ``S``). They coincide only when ``S`` is well-approximated by a
+    single point (``|S| = 1``); as ``S`` grows, PCA captures
+    correlation structure that FPS cannot see. The gap between them is
+    the empirical question this project is built around.
+
+    Warm-up
+    -------
+    If ``core_emb`` is provided, the first pick is ``argmax`` cosine
+    similarity to it (same as :class:`RelevanceSelector`'s first pick).
+    Otherwise the first pick is random by ``seed``. This makes FPS
+    deterministic given ``(core_emb, seed)`` and consistent with MMR's
+    warm-up semantics.
+    """
+
+    name = "fps"
+
+    def __init__(
+        self,
+        seed: int = 0,
+        metric: str = "euclidean",
+        **cfg,
+    ) -> None:
+        super().__init__(seed=seed, **cfg)
+        if metric not in ("euclidean", "cosine"):
+            raise ValueError(
+                f"metric must be 'euclidean' or 'cosine', got {metric!r}"
+            )
+        self.metric = metric
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        n = pool_emb.shape[0]
+        if n == 0:
+            return [], {
+                "n_candidates": 0,
+                "metric": self.metric,
+                "step_scores": [],
+            }
+
+        X = np.asarray(pool_emb, dtype=np.float64)
+
+        # ---- warm-up ---------------------------------------------------
+        if core_emb is not None:
+            warmup = "anchor"
+            order = np.argsort(
+                -_cosine_sim_to_anchor(X, core_emb), kind="stable"
+            )
+        else:
+            warmup = "random"
+            order = make_rng(self.seed).permutation(n)
+
+        first: int | None = None
+        running = 0
+        for raw in order:
+            i = int(raw)
+            if running + int(pool_tokens[i]) <= budget:
+                first = i
+                break
+        if first is None:
+            return [], {
+                "n_candidates": n,
+                "metric": self.metric,
+                "step_scores": [],
+                "warmup": warmup,
+            }
+
+        selected: list[int] = [first]
+        selected_mask = np.zeros(n, dtype=bool)
+        selected_mask[first] = True
+        running += int(pool_tokens[first])
+
+        # Running minimum distance from each candidate to any selected.
+        # Initialised to the distance to the first pick; updated by
+        # element-wise minimum on each subsequent pick.
+        min_dist = _distance_to_point(X, X[first], self.metric)
+        min_dist[first] = -np.inf  # exclude the first pick itself
+        step_scores: list[float] = [0.0]  # warm-up by convention
+
+        # ---- greedy loop ----------------------------------------------
+        while True:
+            scores = min_dist.copy()
+            scores[selected_mask] = -np.inf
+            fits = (pool_tokens + running) <= budget
+            scores[~fits] = -np.inf
+
+            best = int(np.argmax(scores))
+            if not np.isfinite(scores[best]):
+                break
+
+            selected.append(best)
+            selected_mask[best] = True
+            running += int(pool_tokens[best])
+            step_scores.append(float(scores[best]))
+            np.minimum(
+                min_dist,
+                _distance_to_point(X, X[best], self.metric),
+                out=min_dist,
+            )
+            min_dist[best] = -np.inf
+
+        meta = {
+            "n_candidates": n,
+            "metric": self.metric,
+            "step_scores": step_scores,
+            "warmup": warmup,
+        }
+        return selected, meta

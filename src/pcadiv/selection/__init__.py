@@ -2,6 +2,7 @@
 from pcadiv.selection.selectors import (
     BaseSelector,
     DynamicMMRSelector,
+    FPSSelector,
     MMRSelector,
     RandomSelector,
     RelevanceSelector,
@@ -14,6 +15,7 @@ from pcadiv.selection.selectors import (
 __all__ = [
     "BaseSelector",
     "DynamicMMRSelector",
+    "FPSSelector",
     "MMRSelector",
     "RandomSelector",
     "RelevanceSelector",
