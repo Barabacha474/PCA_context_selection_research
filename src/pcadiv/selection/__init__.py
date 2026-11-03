@@ -2,6 +2,7 @@
 from pcadiv.selection.selectors import (
     BaseSelector,
     RandomSelector,
+    RelevanceSelector,
     SelectionResult,
     get_selector,
     list_selectors,
@@ -11,6 +12,7 @@ from pcadiv.selection.selectors import (
 __all__ = [
     "BaseSelector",
     "RandomSelector",
+    "RelevanceSelector",
     "SelectionResult",
     "get_selector",
     "list_selectors",

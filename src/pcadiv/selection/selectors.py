@@ -350,3 +350,73 @@ class RandomSelector(BaseSelector):
         perm = rng.permutation(n).tolist()
         meta = {"n_candidates": int(n), "budget": int(budget)}
         return perm, meta
+
+# ---------------------------------------------------------------------
+# Cosine helper (shared by Relevance and MMR)
+# ---------------------------------------------------------------------
+
+def _cosine_sim_to_anchor(X: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    """Cosine similarity of each row of ``X`` to a 1-D ``anchor``.
+
+    * Works for unnormalized inputs -- this is cosine, not dot product.
+    * Zero-norm rows and a zero-norm anchor yield similarity ``0.0``
+      (no direction, no signal) rather than ``NaN``.
+    * Non-finite values are also mapped to ``0.0`` so a single corrupt
+      row cannot poison the whole selection.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    anchor = np.asarray(anchor, dtype=np.float64)
+    x_norms = np.linalg.norm(X, axis=1)
+    a_norm = float(np.linalg.norm(anchor))
+    denom = x_norms * a_norm
+    safe = np.where(denom > 0, denom, 1.0)
+    sim = (X @ anchor) / safe
+    np.clip(sim, -1.0, 1.0, out=sim)
+    sim = np.where(denom > 0, sim, 0.0)
+    sim = np.where(np.isfinite(sim), sim, 0.0)
+    return sim
+
+
+# ---------------------------------------------------------------------
+# RelevanceSelector
+# ---------------------------------------------------------------------
+
+@register_selector
+class RelevanceSelector(BaseSelector):
+    """Top-``k`` by cosine similarity to an anchor vector.
+
+    In the **primary sweep** this is the *centrality* baseline: the
+    anchor is the pool centroid, so the method selects the most typical
+    passages -- the opposite of diversity. In the **secondary sweep**
+    the anchor is a real query embedding, so the method becomes
+    classic top-``k`` relevance retrieval.
+
+    Requires ``core_emb``: raises ``ValueError`` when it is ``None``.
+    Order is deterministic: descending similarity, ties broken by lower
+    index (stable sort).
+    """
+
+    name = "relevance"
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        del pool_tokens, budget  # not used -- _pack enforces the budget
+        if core_emb is None:
+            raise ValueError(
+                "RelevanceSelector requires core_emb (an anchor vector); "
+                "got None. In the primary sweep pass the pool centroid "
+                "('centrality' baseline); in the secondary sweep pass "
+                "the query embedding."
+            )
+        sim = _cosine_sim_to_anchor(pool_emb, core_emb)
+        order = np.argsort(-sim, kind="stable").tolist()
+        meta = {
+            "n_candidates": int(pool_emb.shape[0]),
+            "anchor_norm": float(np.linalg.norm(core_emb)),
+        }
+        return order, meta
