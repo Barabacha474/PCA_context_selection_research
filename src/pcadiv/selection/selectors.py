@@ -63,6 +63,7 @@ pipelines, and one implementation means one place to test it.
 """
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Sequence
@@ -824,3 +825,149 @@ class FPSSelector(BaseSelector):
             "warmup": warmup,
         }
         return selected, meta
+
+
+# ---------------------------------------------------------------------
+# PCA helpers (shared by Static and Iterative PCA selectors)
+# ---------------------------------------------------------------------
+
+def _fit_top_k_subspace(
+    X: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return top-``k`` principal directions of ``X`` and their eigenvalues.
+
+    Computed via ``eigh`` on the ``D×D`` gram matrix ``XᵀX``, not via
+    SVD of ``X``. For ``N >> D`` this is ``O(D³ + N·D²)`` instead of
+    ``O(N·D²)`` -- important at pool sizes of 50k with ``D = 768``.
+
+    The directions are returned as a ``(D, k)`` matrix with orthonormal
+    columns, eigenvalues in **descending** order. The sign of each
+    eigenvector is arbitrary (as :func:`numpy.linalg.eigh` decides), but
+    projections ``U Uᵀ`` are sign-invariant, so downstream selection is
+    deterministic across runs and platforms.
+
+    Parameters
+    ----------
+    X
+        ``float64`` array ``(N, D)``. No centering is applied -- the
+        proposal's formula is on raw embeddings.
+    k
+        Number of directions to keep. If ``k > D`` it is silently
+        capped to ``D``; callers that care should cap before calling.
+    """
+    D = X.shape[1]
+    k = min(k, D)
+    G = X.T @ X
+    eigvals, eigvecs = np.linalg.eigh(G)  # ascending order
+    eigvals = eigvals[::-1][:k].copy()
+    eigvecs = eigvecs[:, ::-1][:, :k].copy()
+    return eigvecs, eigvals
+
+
+def _residuals_sq(X: np.ndarray, U: np.ndarray) -> np.ndarray:
+    """Squared residual norms of ``X`` outside ``span(U)``.
+
+    Uses ``||x||² − ||Uᵀx||²`` (valid because ``U`` has orthonormal
+    columns). Clamped at zero to absorb floating-point cancellation --
+    a point already in ``span(U)`` has exact residual ``0``, but the
+    subtraction could otherwise give ``-1e-16``.
+    """
+    if U.shape[1] == 0:
+        return np.einsum("ij,ij->i", X, X)
+    norms_sq = np.einsum("ij,ij->i", X, X)
+    proj = X @ U
+    proj_sq = np.einsum("ij,ij->i", proj, proj)
+    return np.maximum(norms_sq - proj_sq, 0.0)
+
+# ---------------------------------------------------------------------
+# StaticPCASelector
+# ---------------------------------------------------------------------
+
+@register_selector
+class StaticPCASelector(BaseSelector):
+    """Static PCA ablation: fixed subspace, rank all candidates by residual.
+
+    Fit PCA once on the **entire pool**, keep top-``k`` directions
+    ``U_k``, and rank every pool item by ``||x − U_k U_kᵀ x||²``.
+    Selection is then simply: walk candidates in descending residual
+    order, pack to budget. The ranking ignores what has already been
+    selected -- that is precisely what distinguishes this ablation from
+    :class:`IterativePCASelector`, which refits ``U_k`` after every pick.
+
+    Why this is an ablation
+    -----------------------
+    If IterativePCA beats StaticPCA in the experiments, the difference
+    isolates the value of **online subspace updating**. If they tie, the
+    cheaper static version wins by parsimony.
+
+    No centering
+    ------------
+    PCA here is applied to **raw** embeddings (no mean subtraction).
+    This matches the proposal's formula literally, avoids an ill-defined
+    "mean of what" question, and keeps the residual interpretation
+    simple: how much of ``x`` lives outside the pool's dominant
+    directions. For L2-normalised embeddings the mean is often close to
+    zero anyway.
+
+    No warm-up
+    ----------
+    Residuals are defined for every candidate from the start, so there
+    is no special first pick. ``core_emb`` is accepted for interface
+    symmetry but ignored.
+
+    Degenerate case
+    ---------------
+    When ``k >= min(N, D)`` the subspace spans the data and every
+    residual is ≈ 0; selection degenerates to index order. A
+    ``RuntimeWarning`` is emitted so that a misconfigured sweep does
+    not silently produce trivial selections.
+    """
+
+    name = "static_pca"
+
+    def __init__(self, seed: int = 0, k: int = 5, **cfg) -> None:
+        super().__init__(seed=seed, **cfg)
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        self.k = int(k)
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        del core_emb  # anchor-free by design
+
+        n = pool_emb.shape[0]
+        if n == 0:
+            return [], {
+                "n_candidates": 0,
+                "k_requested": self.k,
+                "k_eff": 0,
+            }
+
+        X = np.asarray(pool_emb, dtype=np.float64)
+        D = X.shape[1]
+        k_eff = min(self.k, D, n)
+        if self.k > k_eff:
+            warnings.warn(
+                f"StaticPCASelector: k={self.k} > min(N, D)={k_eff}; "
+                f"capping to {k_eff}. Residuals will be near zero and "
+                f"selection will degenerate.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        U, eigvals = _fit_top_k_subspace(X, k_eff)
+        residuals = _residuals_sq(X, U)
+        order = np.argsort(-residuals, kind="stable").tolist()
+
+        meta = {
+            "n_candidates": int(n),
+            "k_requested": int(self.k),
+            "k_eff": int(k_eff),
+            "top_eigenvalues": eigvals.tolist(),
+        }
+        return order, meta
