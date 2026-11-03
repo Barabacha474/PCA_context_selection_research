@@ -836,32 +836,68 @@ def _fit_top_k_subspace(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return top-``k`` principal directions of ``X`` and their eigenvalues.
 
-    Computed via ``eigh`` on the ``D×D`` gram matrix ``XᵀX``, not via
-    SVD of ``X``. For ``N >> D`` this is ``O(D³ + N·D²)`` instead of
-    ``O(N·D²)`` -- important at pool sizes of 50k with ``D = 768``.
+    Two computation paths, chosen by shape:
 
-    The directions are returned as a ``(D, k)`` matrix with orthonormal
-    columns, eigenvalues in **descending** order. The sign of each
-    eigenvector is arbitrary (as :func:`numpy.linalg.eigh` decides), but
-    projections ``U Uᵀ`` are sign-invariant, so downstream selection is
-    deterministic across runs and platforms.
+    * ``N >= D``: eigendecompose the ``D×D`` gram matrix ``XᵀX``.
+      Standard approach for "tall" matrices (the pool in static PCA).
+    * ``N < D``:  eigendecompose the ``N×N`` gram matrix ``XXᵀ``, then
+      project back via ``U = Xᵀ V / √λ``. For the iterative selector,
+      ``X`` is the **selected set** with ``|S| << D``; this path is
+      ``O(N³ + N·D²)`` instead of ``O(D³ + N·D²)`` -- a factor
+      ``(D/N)³`` speedup, which at ``N = 100, D = 768`` is ~450x.
+
+    Near-zero eigenvalues are dropped (relative threshold
+    ``1e-10 · λ_max``), so the returned ``U`` never contains numerical
+    noise directions whose contribution to ``U Uᵀ`` would be garbage.
+    Directions are orthonormal; eigenvalues are in **descending** order;
+    sign is arbitrary but ``U Uᵀ`` is sign-invariant.
 
     Parameters
     ----------
     X
-        ``float64`` array ``(N, D)``. No centering is applied -- the
-        proposal's formula is on raw embeddings.
+        ``float64`` array ``(N, D)``. No centering.
     k
-        Number of directions to keep. If ``k > D`` it is silently
-        capped to ``D``; callers that care should cap before calling.
+        Requested directions. Capped by ``min(N, D)`` and by the numeric
+        rank of ``X``.
+
+    Returns
+    -------
+    U
+        ``(D, k_eff)`` orthonormal-column matrix.
+    eigvals
+        ``(k_eff,)`` non-increasing eigenvalues.
     """
-    D = X.shape[1]
-    k = min(k, D)
-    G = X.T @ X
-    eigvals, eigvecs = np.linalg.eigh(G)  # ascending order
+    N, D = X.shape
+    if N == 0 or D == 0:
+        return np.zeros((D, 0)), np.empty(0)
+    k = min(k, D, N)
+
+    if N >= D:
+        G = X.T @ X
+        eigvals, eigvecs = np.linalg.eigh(G)
+        eigvals = eigvals[::-1][:k].copy()
+        eigvecs = eigvecs[:, ::-1][:, :k].copy()
+        if len(eigvals) > 0:
+            eps = max(float(eigvals[0]) * 1e-10, 1e-15)
+            keep = eigvals > eps
+            eigvals = eigvals[keep]
+            eigvecs = eigvecs[:, keep]
+        return eigvecs, eigvals
+
+    G_small = X @ X.T
+    eigvals, V = np.linalg.eigh(G_small)
     eigvals = eigvals[::-1][:k].copy()
-    eigvecs = eigvecs[:, ::-1][:, :k].copy()
-    return eigvecs, eigvals
+    V = V[:, ::-1][:, :k].copy()
+    if len(eigvals) > 0:
+        eps = max(float(eigvals[0]) * 1e-10, 1e-15)
+        keep = eigvals > eps
+        eigvals = eigvals[keep]
+        V = V[:, keep]
+    if len(eigvals) == 0:
+        return np.zeros((D, 0)), np.empty(0)
+    U = X.T @ V
+    U = U / np.sqrt(eigvals)[None, :]
+    return U, eigvals
 
 
 def _residuals_sq(X: np.ndarray, U: np.ndarray) -> np.ndarray:
@@ -971,3 +1007,212 @@ class StaticPCASelector(BaseSelector):
             "top_eigenvalues": eigvals.tolist(),
         }
         return order, meta
+
+# ---------------------------------------------------------------------
+# IterativePCASelector  (the proposed method)
+# ---------------------------------------------------------------------
+
+@register_selector
+class IterativePCASelector(BaseSelector):
+    """Iterative PCA novelty selection -- the proposed method.
+
+    At each step, compute the top-``k`` principal directions of the
+    **already selected** embeddings, and pick the candidate with the
+    largest squared residual outside that subspace::
+
+        score(x) = || x − U_k U_kᵀ x ||²
+
+    where ``U_k`` is refit from ``S`` on every step. Higher score means
+    ``x`` covers a direction the selected set does not yet span.
+
+    Relationship to other methods
+    -----------------------------
+    * :class:`StaticPCASelector` fits ``U_k`` once on the full pool.
+      The gap between them isolates the value of **online updating**.
+    * :class:`FPSSelector` ranks by ``min_{s∈S} d(x, s)`` (nearest
+      selected neighbour). PCA ranks by residual **outside the
+      subspace** spanned by ``S``. They differ once ``|S| > 1`` -- FPS
+      is local, PCA is global over ``S``.
+
+    Warm-up (``S = ∅``)
+    -------------------
+    Residual against an empty subspace is ``||x||²``, so the natural
+    first pick is ``argmax ||x||²``. This is ``warmup="norm"`` (the
+    default). ``warmup="random"`` picks a seeded random point instead;
+    useful for robustness checks. If ``core_emb`` is provided, it takes
+    precedence: first pick is ``argmax`` cosine to the anchor, matching
+    :class:`MMRSelector`/:class:`FPSSelector` semantics.
+
+    Effective ``k``
+    ---------------
+    ``k_eff = min(k, |S|, D)`` -- cannot have more principal directions
+    than selected points. With ``variance_threshold`` set (e.g. ``0.9``),
+    ``k_eff`` is additionally shrunk to the smallest count whose top
+    eigenvalues explain that fraction of total variance.
+
+    Over-picking caveat
+    -------------------
+    Once ``|S|`` grows, a tight cluster of points not in ``span(U_k)``
+    all get near-equal high residual, so the selector may pick several
+    from that cluster before another direction "wins". This is a real
+    property of the residual criterion, not a bug; it shows up in
+    diversity curves and in the qualitative coherence check (Block 14).
+    Documented here so that readings of the results do not treat it as
+    unexpected.
+    """
+
+    name = "iterative_pca"
+
+    def __init__(
+        self,
+        seed: int = 0,
+        k: int = 5,
+        variance_threshold: float | None = None,
+        warmup: str = "norm",
+        **cfg,
+    ) -> None:
+        super().__init__(seed=seed, **cfg)
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        if variance_threshold is not None and not 0.0 < variance_threshold <= 1.0:
+            raise ValueError(
+                f"variance_threshold must be in (0, 1], got {variance_threshold}"
+            )
+        if warmup not in ("norm", "random"):
+            raise ValueError(
+                f"warmup must be 'norm' or 'random', got {warmup!r}"
+            )
+        self.k = int(k)
+        self.variance_threshold = variance_threshold
+        self.warmup = warmup
+
+    # -- subspace at each step ---------------------------------------
+
+    def _compute_subspace(
+        self, sel_emb: np.ndarray
+    ) -> tuple[np.ndarray, int, np.ndarray]:
+        """Return ``(U, k_eff, eigvals)`` for the current selected set."""
+        n_sel, D = sel_emb.shape
+        max_k = min(self.k, n_sel, D)
+        if max_k == 0:
+            return np.zeros((D, 0)), 0, np.empty(0)
+
+        U, eigvals = _fit_top_k_subspace(sel_emb, max_k)
+        k_eff = U.shape[1]
+
+        if self.variance_threshold is not None and len(eigvals) > 0:
+            total = float(eigvals.sum())
+            if total > 1e-12:
+                ratios = np.cumsum(eigvals) / total
+                k_from_thresh = int(np.searchsorted(ratios, self.variance_threshold) + 1)
+                k_from_thresh = min(k_from_thresh, k_eff)
+                if k_from_thresh < k_eff:
+                    k_eff = k_from_thresh
+                    U = U[:, :k_eff]
+                    eigvals = eigvals[:k_eff]
+            # else: total variance ~0 (all selected points identical);
+            # keep whatever _fit_top_k_subspace returned.
+
+        return U, k_eff, eigvals
+
+    # -- main entry point --------------------------------------------
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        n = pool_emb.shape[0]
+        if n == 0:
+            return [], {
+                "n_candidates": 0,
+                "k_requested": self.k,
+                "variance_threshold": self.variance_threshold,
+                "step_scores": [],
+                "step_k_eff": [],
+            }
+
+        X = np.asarray(pool_emb, dtype=np.float64)
+        D = X.shape[1]
+
+        # ---- warm-up ---------------------------------------------------
+        if core_emb is not None:
+            warmup_mode = "anchor"
+            order = np.argsort(
+                -_cosine_sim_to_anchor(X, core_emb), kind="stable"
+            )
+        elif self.warmup == "norm":
+            warmup_mode = "norm"
+            norms_sq = np.einsum("ij,ij->i", X, X)
+            order = np.argsort(-norms_sq, kind="stable")
+        else:
+            warmup_mode = "random"
+            order = make_rng(self.seed).permutation(n)
+
+        selected: list[int] = []
+        running = 0
+        first: int | None = None
+        for raw in order:
+            i = int(raw)
+            if running + int(pool_tokens[i]) <= budget:
+                first = i
+                break
+        if first is None:
+            return [], {
+                "n_candidates": n,
+                "k_requested": self.k,
+                "variance_threshold": self.variance_threshold,
+                "step_scores": [],
+                "step_k_eff": [],
+                "warmup": warmup_mode,
+            }
+
+        selected_mask = np.zeros(n, dtype=bool)
+        selected.append(first)
+        selected_mask[first] = True
+        running += int(pool_tokens[first])
+
+        step_scores: list[float] = [0.0]
+        step_k_eff: list[int] = [0]
+        step_eigvals: list[list[float]] = [[]]
+
+        # ---- greedy loop ----------------------------------------------
+        while True:
+            sel_emb = X[selected]
+            U, k_eff, eigvals = self._compute_subspace(sel_emb)
+
+            if k_eff == 0:
+                # No directions available (all selected points are zero
+                # vectors). Fall back to raw norm², which is residual
+                # against the empty subspace.
+                scores = np.einsum("ij,ij->i", X, X).copy()
+            else:
+                scores = _residuals_sq(X, U)
+
+            scores[selected_mask] = -np.inf
+            fits = (pool_tokens + running) <= budget
+            scores[~fits] = -np.inf
+
+            best = int(np.argmax(scores))
+            if not np.isfinite(scores[best]):
+                break
+
+            selected.append(best)
+            selected_mask[best] = True
+            running += int(pool_tokens[best])
+            step_scores.append(float(scores[best]))
+            step_k_eff.append(int(k_eff))
+            step_eigvals.append(eigvals.tolist())
+
+        meta = {
+            "n_candidates": int(n),
+            "k_requested": int(self.k),
+            "variance_threshold": self.variance_threshold,
+            "warmup": warmup_mode,
+            "step_scores": step_scores,
+            "step_k_eff": step_k_eff,
+            "step_eigvals": step_eigvals,
+        }
+        return selected, meta
