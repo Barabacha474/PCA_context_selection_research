@@ -420,3 +420,237 @@ class RelevanceSelector(BaseSelector):
             "anchor_norm": float(np.linalg.norm(core_emb)),
         }
         return order, meta
+
+# ---------------------------------------------------------------------
+# MMRSelector
+# ---------------------------------------------------------------------
+
+@register_selector
+class MMRSelector(BaseSelector):
+    """Maximal Marginal Relevance with a fixed anchor.
+
+    At each step, choose::
+
+        score(x) = λ · sim(q, x) − (1−λ) · max_{s∈S} sim(s, x)
+
+    where ``q`` is ``core_emb`` and ``S`` is the already selected set.
+    Higher λ favors relevance to the anchor; lower λ favors diversity
+    against the selected set.
+
+    Edge cases
+    ----------
+    * ``λ = 1`` degenerates to :class:`RelevanceSelector` (verified by
+      a test).
+    * ``λ = 0`` needs no anchor; ``core_emb`` may be ``None``.
+    * ``λ > 0`` requires ``core_emb``; ``None`` raises ``ValueError``.
+    * Warm-up (``S = ∅``): with an anchor, pick argmax relevance;
+      without, pick a random item seeded by ``seed``.
+    * Budget is enforced *inside* the greedy loop: a candidate that
+      would exceed the remaining budget is excluded from ``argmax``,
+      not silently dropped afterwards. This keeps ``max_sim`` consistent
+      with the actual selected set.
+    """
+
+    name = "mmr"
+
+    def __init__(self, seed: int = 0, lambda_: float = 0.7, **cfg) -> None:
+        super().__init__(seed=seed, **cfg)
+        if not 0.0 <= lambda_ <= 1.0:
+            raise ValueError(f"lambda_ must be in [0, 1], got {lambda_}")
+        self.lambda_ = float(lambda_)
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        n = pool_emb.shape[0]
+        if n == 0:
+            return [], {"n_candidates": 0, "lambda": self.lambda_, "step_scores": []}
+        if core_emb is None and self.lambda_ > 0:
+            raise ValueError(
+                "MMRSelector with lambda_ > 0 requires core_emb; "
+                "pass the pool centroid (centrality mode) or a query "
+                "embedding, or set lambda_=0 for diversity-only MMR."
+            )
+
+        X = np.asarray(pool_emb, dtype=np.float64)
+        rel = (
+            _cosine_sim_to_anchor(X, core_emb)
+            if core_emb is not None
+            else np.zeros(n, dtype=np.float64)
+        )
+
+        max_sim = np.full(n, -np.inf, dtype=np.float64)
+        selected_mask = np.zeros(n, dtype=bool)
+        selected: list[int] = []
+        step_scores: list[float] = []
+        running = 0
+
+        # ---- warm-up ---------------------------------------------------
+        warmup = "relevance" if (self.lambda_ > 0 and core_emb is not None) else "random"
+        if warmup == "relevance":
+            order = np.argsort(-rel, kind="stable")
+        else:
+            order = make_rng(self.seed).permutation(n)
+
+        first: int | None = None
+        for raw in order:
+            i = int(raw)
+            if running + int(pool_tokens[i]) <= budget:
+                first = i
+                break
+        if first is None:
+            return [], {
+                "n_candidates": n,
+                "lambda": self.lambda_,
+                "step_scores": [],
+                "warmup": warmup,
+            }
+
+        selected.append(first)
+        selected_mask[first] = True
+        running += int(pool_tokens[first])
+        step_scores.append(float(rel[first]))
+        np.maximum(max_sim, _cosine_sim_to_anchor(X, X[first]), out=max_sim)
+        max_sim[first] = -np.inf
+
+        # ---- greedy loop ----------------------------------------------
+        while True:
+            scores = self.lambda_ * rel - (1.0 - self.lambda_) * max_sim
+            scores[selected_mask] = -np.inf
+            fits = (pool_tokens + running) <= budget
+            scores[~fits] = -np.inf
+
+            best = int(np.argmax(scores))
+            if not np.isfinite(scores[best]):
+                break
+
+            selected.append(best)
+            selected_mask[best] = True
+            running += int(pool_tokens[best])
+            step_scores.append(float(scores[best]))
+            np.maximum(max_sim, _cosine_sim_to_anchor(X, X[best]), out=max_sim)
+            max_sim[best] = -np.inf
+
+        meta = {
+            "n_candidates": n,
+            "lambda": self.lambda_,
+            "step_scores": step_scores,
+            "warmup": warmup,
+        }
+        return selected, meta
+
+
+# ---------------------------------------------------------------------
+# DynamicMMRSelector
+# ---------------------------------------------------------------------
+
+@register_selector
+class DynamicMMRSelector(BaseSelector):
+    """MMR whose relevance anchor is the centroid of the selected set.
+
+    At each step, choose::
+
+        score(x) = λ · sim(centroid(S), x) − (1−λ) · max_{s∈S} sim(s, x)
+
+    The anchor moves as ``S`` grows. This makes the relevance term a
+    "typicality within S" signal, complementary to the diversity term
+    "distance from any member of S".
+
+    Warm-up (``S = ∅``): if ``λ > 0`` and ``core_emb`` is provided, use
+    argmax relevance to it; otherwise pick randomly by ``seed``. This
+    keeps the first step deterministic and independent of the moving
+    centroid (which is undefined when ``S`` is empty).
+
+    Budget is enforced inside the greedy loop, same as for
+    :class:`MMRSelector`.
+    """
+
+    name = "mmr_dynamic"
+
+    def __init__(self, seed: int = 0, lambda_: float = 0.7, **cfg) -> None:
+        super().__init__(seed=seed, **cfg)
+        if not 0.0 <= lambda_ <= 1.0:
+            raise ValueError(f"lambda_ must be in [0, 1], got {lambda_}")
+        self.lambda_ = float(lambda_)
+
+    def _select_indices(
+        self,
+        pool_emb: np.ndarray,
+        pool_tokens: np.ndarray,
+        budget: int,
+        core_emb: np.ndarray | None,
+    ) -> tuple[list[int], dict]:
+        n = pool_emb.shape[0]
+        if n == 0:
+            return [], {"n_candidates": 0, "lambda": self.lambda_, "step_scores": []}
+
+        X = np.asarray(pool_emb, dtype=np.float64)
+        max_sim = np.full(n, -np.inf, dtype=np.float64)
+        selected_mask = np.zeros(n, dtype=bool)
+        selected: list[int] = []
+        step_scores: list[float] = []
+        running = 0
+        centroid_sum = np.zeros(X.shape[1], dtype=np.float64)
+
+        # ---- warm-up ---------------------------------------------------
+        if core_emb is not None and self.lambda_ > 0:
+            warmup = "anchor"
+            order = np.argsort(-_cosine_sim_to_anchor(X, core_emb), kind="stable")
+        else:
+            warmup = "random"
+            order = make_rng(self.seed).permutation(n)
+
+        first: int | None = None
+        for raw in order:
+            i = int(raw)
+            if running + int(pool_tokens[i]) <= budget:
+                first = i
+                break
+        if first is None:
+            return [], {
+                "n_candidates": n,
+                "lambda": self.lambda_,
+                "step_scores": [],
+                "warmup": warmup,
+            }
+
+        selected.append(first)
+        selected_mask[first] = True
+        running += int(pool_tokens[first])
+        centroid_sum += X[first]
+        step_scores.append(0.0)
+        np.maximum(max_sim, _cosine_sim_to_anchor(X, X[first]), out=max_sim)
+        max_sim[first] = -np.inf
+
+        # ---- greedy loop ----------------------------------------------
+        while True:
+            centroid = centroid_sum / len(selected)
+            rel = _cosine_sim_to_anchor(X, centroid)
+            scores = self.lambda_ * rel - (1.0 - self.lambda_) * max_sim
+            scores[selected_mask] = -np.inf
+            fits = (pool_tokens + running) <= budget
+            scores[~fits] = -np.inf
+
+            best = int(np.argmax(scores))
+            if not np.isfinite(scores[best]):
+                break
+
+            selected.append(best)
+            selected_mask[best] = True
+            running += int(pool_tokens[best])
+            centroid_sum += X[best]
+            step_scores.append(float(scores[best]))
+            np.maximum(max_sim, _cosine_sim_to_anchor(X, X[best]), out=max_sim)
+            max_sim[best] = -np.inf
+
+        meta = {
+            "n_candidates": n,
+            "lambda": self.lambda_,
+            "step_scores": step_scores,
+            "warmup": warmup,
+        }
+        return selected, meta

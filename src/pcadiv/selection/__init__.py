@@ -1,6 +1,8 @@
 """Selector family re-exports."""
 from pcadiv.selection.selectors import (
     BaseSelector,
+    DynamicMMRSelector,
+    MMRSelector,
     RandomSelector,
     RelevanceSelector,
     SelectionResult,
@@ -11,6 +13,8 @@ from pcadiv.selection.selectors import (
 
 __all__ = [
     "BaseSelector",
+    "DynamicMMRSelector",
+    "MMRSelector",
     "RandomSelector",
     "RelevanceSelector",
     "SelectionResult",
