@@ -276,3 +276,196 @@ class MeanPairwiseDistance(BaseMetric):
         D = pairwise_distances(X, self.metric)
         iu = np.triu_indices(n, k=1)
         return {"mean_pairwise": float(D[iu].mean())}
+
+# ---------------------------------------------------------------------
+# Coverage (radius + logdet)
+# ---------------------------------------------------------------------
+
+@register_metric
+class Coverage(BaseMetric):
+    """Coverage / volume of a set of embeddings.
+
+    Two complementary scalars, both in the embedding space:
+
+    * ``coverage_radius`` -- maximum distance from a point to the
+      centroid. Cheap and robust; grows with the spread of the set but
+      ignores how many directions are used.
+    * ``coverage_logdet`` -- natural log of the **pseudodeterminant** of
+      the unbiased covariance matrix. It accounts for how many
+      independent directions the set spans, not just how far.
+
+    Pseudodeterminant
+    -----------------
+    With ``N < D`` (which is the typical case at small token budgets)
+    the covariance matrix is rank-deficient and the naive logdet is
+    ``-inf``. ``-inf`` in a tidy DataFrame silently poisons
+    ``groupby(...).mean()`` and parquet readers. The convention used
+    here is: keep only eigenvalues above a relative threshold
+    (``1e-10 * λ_max``), take the sum of their logs. For a fully
+    collapsed set (all points identical, or ``N <= 1``) this returns
+    ``0.0``. This is a **convention**, not a limit -- it keeps values
+    finite so that curves and statistics remain well-defined.
+
+    Empty / tiny sets
+    -----------------
+    * ``N = 0`` or ``N = 1``: both values are ``0.0``.
+    * All points identical: ``radius = 0``, ``logdet = 0``.
+
+    Both keys are always present, so ``budget_curve`` produces a
+    rectangular DataFrame.
+    """
+
+    name = "coverage"
+
+    def __call__(
+        self,
+        emb: np.ndarray,
+        *,
+        core_emb: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        X, _ = self._validate_inputs(emb, core_emb)
+        n = X.shape[0]
+        if n <= 1:
+            return {"coverage_radius": 0.0, "coverage_logdet": 0.0}
+
+        centroid = X.mean(axis=0)
+        diff = X - centroid
+        radius = float(np.sqrt((diff * diff).sum(axis=1)).max())
+
+        cov = (diff.T @ diff) / (n - 1)
+        eigvals = np.linalg.eigvalsh(cov)  # ascending, real, symmetric
+
+        if len(eigvals) == 0:
+            return {"coverage_radius": radius, "coverage_logdet": 0.0}
+
+        lam_max = float(eigvals[-1])
+        eps = max(lam_max * 1e-10, 1e-15)
+        positive = eigvals[eigvals > eps]
+        if len(positive) == 0:
+            logdet = 0.0
+        else:
+            logdet = float(np.sum(np.log(positive)))
+
+        return {"coverage_radius": radius, "coverage_logdet": logdet}
+
+# ---------------------------------------------------------------------
+# VendiScore
+# ---------------------------------------------------------------------
+
+@register_metric
+class VendiScore(BaseMetric):
+    """Vendi Score: effective rank of the kernel eigenvalue spectrum.
+
+    Formally, for ``N`` points with kernel matrix ``K``::
+
+        Vendi = exp( H( p ) ),   p_i = λ_i / Σ_j λ_j
+
+    where ``λ_i`` are eigenvalues of ``K`` and ``H`` is either Shannon
+    (``q = 1``) or Rényi entropy of order ``q``. ``Vendi = 1`` for a
+    set of identical points, ``Vendi = N`` for ``N`` maximally
+    independent points.
+
+    Kernel
+    ------
+    * ``"rbf"`` (default): ``K(x, y) = exp(-γ · ||x - y||²)``.
+    * ``"cosine"``: ``K(x, y) = exp(γ · cos_sim(x, y))``.
+
+    Gamma (γ)
+    ---------
+    * ``gamma=None`` (default): **median heuristic** --
+      ``γ = 1 / median(pairwise_sqdist)`` for RBF, or ``γ = 1`` for
+      cosine. This is the standard RBF bandwidth choice in the Vendi
+      literature. **Caveat:** with median heuristic the score depends
+      on the *whole subset* (through the median), not just on
+      pairwise distances. That is normal for Vendi, but means Vendi
+      values are not directly comparable between subsets of very
+      different sizes.
+    * ``gamma=<float>``: fixed bandwidth. Use this when comparing
+      values across widely different ``N``.
+
+    Renyi order ``q``
+    -----------------
+    Default ``q = 1.0`` (Shannon). For ``q ≠ 1`` the score is the
+    Rényi variant, which weights the tail of the eigenvalue spectrum
+    differently. ``q = 1`` matches the reference implementation from
+    the Vendi paper.
+    """
+
+    name = "vendi"
+
+    def __init__(
+        self,
+        kernel: str = "rbf",
+        gamma: float | None = None,
+        q: float = 1.0,
+    ) -> None:
+        super().__init__(kernel=kernel, gamma=gamma, q=q)
+        if kernel not in ("rbf", "cosine"):
+            raise ValueError(
+                f"kernel must be 'rbf' or 'cosine', got {kernel!r}"
+            )
+        if gamma is not None and gamma <= 0:
+            raise ValueError(f"gamma must be positive, got {gamma}")
+        if q <= 0:
+            raise ValueError(f"q must be positive, got {q}")
+        self.kernel = kernel
+        self.gamma = gamma
+        self.q = float(q)
+
+    # -- helpers -----------------------------------------------------
+
+    def _kernel_matrix(self, X: np.ndarray) -> np.ndarray:
+        if self.kernel == "rbf":
+            sq = np.einsum("ij,ij->i", X, X)
+            D2 = sq[:, None] + sq[None, :] - 2.0 * (X @ X.T)
+            np.maximum(D2, 0.0, out=D2)
+            if self.gamma is None:
+                iu = np.triu_indices_from(D2, k=1)
+                median_d2 = float(np.median(D2[iu])) if iu[0].size else 0.0
+                gamma = 1.0 / median_d2 if median_d2 > 0 else 1.0
+            else:
+                gamma = float(self.gamma)
+            return np.exp(-gamma * D2)
+
+        # cosine
+        norms = np.linalg.norm(X, axis=1)
+        denom = np.outer(norms, norms)
+        safe = np.where(denom > 0, denom, 1.0)
+        sim = (X @ X.T) / safe
+        np.clip(sim, -1.0, 1.0, out=sim)
+        gamma = float(self.gamma) if self.gamma is not None else 1.0
+        return np.exp(gamma * sim)
+
+    def _entropy(self, eigvals: np.ndarray) -> float:
+        eigvals = np.maximum(eigvals, 0.0)
+        total = float(eigvals.sum())
+        if total <= 0:
+            return 0.0
+        p = eigvals / total
+        p = p[p > 0]
+        if len(p) == 0:
+            return 0.0
+        if self.q == 1.0:
+            return float(-np.sum(p * np.log(p)))
+        return float(np.log(np.sum(p ** self.q)) / (1.0 - self.q))
+
+    # -- main --------------------------------------------------------
+
+    def __call__(
+        self,
+        emb: np.ndarray,
+        *,
+        core_emb: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        X, _ = self._validate_inputs(emb, core_emb)
+        n = X.shape[0]
+        if n == 0:
+            return {"vendi_score": 0.0}
+        if n == 1:
+            return {"vendi_score": 1.0}
+
+        K = self._kernel_matrix(X)
+        K = 0.5 * (K + K.T)  # symmetrize against fp noise
+        eigvals = np.linalg.eigvalsh(K)
+        entropy = self._entropy(eigvals)
+        return {"vendi_score": float(np.exp(entropy))}
