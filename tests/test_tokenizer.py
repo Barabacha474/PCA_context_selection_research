@@ -115,10 +115,3 @@ def test_tiktoken_fingerprint_depends_on_encoding():
 def test_tiktoken_empty_encoding_raises():
     with pytest.raises(ValueError, match="encoding must be a non-empty"):
         get_tokenizer("tiktoken", encoding="")
-
-
-# ---- HFTokenizerFromModel (stub) ------------------------------------
-
-def test_hf_stub_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="Block 7"):
-        get_tokenizer("hf", model_id="bert-base-uncased")

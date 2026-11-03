@@ -198,28 +198,71 @@ class TiktokenTokenizer(BaseBudgetTokenizer):
         return super().count_many(texts)
 
 
-# ---------------------------------------------------------------------
-# HFTokenizerFromModel (stub until Block 7)
-# ---------------------------------------------------------------------
-
 @register_tokenizer
 class HFTokenizerFromModel(BaseBudgetTokenizer):
     """Budget tokenizer using an HF model's tokenizer.
 
-    **Not implemented yet** -- scheduled for Block 7 alongside HF
-    encoders. Registered now so configs can reference ``name: hf``
-    without breaking, and so the test suite can assert the stub raises
-    a clear error rather than silently doing the wrong thing.
+    Counts tokens as the target model would see them. Special tokens
+    are excluded by default (``add_special_tokens=False``): BOS/EOS
+    overhead is not part of "how much text content fits in the budget".
+
+    Only the **tokenizer files** are downloaded on construction -- never
+    the model weights. For Llama 3-family models use an ungated mirror
+    like ``"NousResearch/Meta-Llama-3-8B"`` or authenticate against the
+    gated ``meta-llama/...`` repos via ``huggingface-cli login``.
+
+    Parameters
+    ----------
+    model_id
+        HF model id or local path.
+    add_special_tokens
+        Whether to include special tokens in the count. Default
+        ``False``.
     """
 
     name = "hf"
 
     def __init__(
-        self, model_id: str, add_special_tokens: bool = False
+        self,
+        model_id: str,
+        add_special_tokens: bool = False,
     ) -> None:
-        raise NotImplementedError(
-            "HFTokenizerFromModel is a stub; implemented in Block 7."
-        )
+        if not model_id:
+            raise ValueError("model_id must be a non-empty string")
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise ImportError(
+                "HFTokenizerFromModel requires 'transformers'. "
+                "Install with: pip install -e \".[encoders]\""
+            ) from e
+        self.model_id = model_id
+        self.add_special_tokens = bool(add_special_tokens)
+        self._tok = AutoTokenizer.from_pretrained(model_id)
 
-    def count(self, text: str) -> int:  # pragma: no cover
-        raise NotImplementedError
+    def _fingerprint_key(self) -> str:
+        return f"model={self.model_id}|add_special={self.add_special_tokens}"
+
+    def count(self, text: str) -> int:
+        if not text:
+            return 0
+        ids = self._tok(
+            text, add_special_tokens=self.add_special_tokens
+        )["input_ids"]
+        return len(ids)
+
+    def count_many(self, texts: Sequence[str]) -> np.ndarray:
+        if len(texts) == 0:
+            return np.empty(0, dtype=np.int64)
+        out = self._tok(
+            list(texts),
+            add_special_tokens=self.add_special_tokens,
+            return_length=True,
+        )
+        if "length" in out:
+            lengths = out["length"]
+        elif "lengths" in out:
+            lengths = out["lengths"]
+        else:  # very old transformers -- fall back to per-item
+            return super().count_many(texts)
+        return np.asarray(lengths, dtype=np.int64)
