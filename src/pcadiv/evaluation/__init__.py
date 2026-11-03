@@ -1,4 +1,5 @@
 """Evaluation family re-exports."""
+from pcadiv.evaluation.budget_curve import budget_curve
 from pcadiv.evaluation.metrics import (
     BaseMetric,
     MeanPairwiseDistance,
@@ -10,6 +11,7 @@ from pcadiv.evaluation.metrics import (
 __all__ = [
     "BaseMetric",
     "MeanPairwiseDistance",
+    "budget_curve",
     "get_metric",
     "list_metrics",
     "register_metric",
