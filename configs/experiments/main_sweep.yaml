@@ -1,0 +1,38 @@
+data:
+  pool_path: data/pools/primary.parquet
+  ood_pool_path: data/pools/ood.parquet
+  cache_dir: data/embeddings
+
+encoders:
+  selection: configs/embed/selection_encoder.yaml
+  eval: configs/embed/eval_encoder.yaml
+
+selectors:
+  - name: random
+    params: {seed: 0}
+  - name: relevance
+    params: {}
+  - name: mmr
+    params: {lambda_: 0.7}
+  - name: mmr_dynamic
+    params: {lambda_: 0.7, seed: 0}
+  - name: fps
+    params: {metric: euclidean, seed: 0}
+  - name: static_pca
+    params: {k: 5}
+  - name: iterative_pca
+    params: {k: 5, warmup: norm}
+
+budgets: [512, 1024, 2048, 4096]
+seeds: [0, 1, 2, 3, 4]
+
+metrics:
+  - name: mean_pairwise
+    params: {}
+  - name: coverage
+    params: {}
+  - name: vendi
+    params: {gamma: 1.0}
+
+output_dir: results/metrics
+sweep_name: main

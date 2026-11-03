@@ -1,0 +1,7 @@
+# Encoder used by *selectors* to score candidates.
+# Default is a small real model so debug runs are cheap; replace with
+# a larger model (e.g. BAAI/bge-large-en-v1.5) for real experiments.
+name: hf_mean
+model_id: prajjwal1/bert-tiny
+device: auto
+normalize: true

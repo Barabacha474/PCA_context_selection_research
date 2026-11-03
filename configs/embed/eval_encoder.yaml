@@ -1,0 +1,8 @@
+# Encoder used by *metrics* to compute diversity.
+# MUST be different from selection_encoder -- otherwise the evaluation
+# metric optimises the same space the selector uses, and the whole
+# comparison is biased.
+name: hf_mean
+model_id: google/bert_uncased_L-2_H-128_A-2
+device: auto
+normalize: true

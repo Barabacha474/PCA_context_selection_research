@@ -1,0 +1,37 @@
+source:
+  hf_dataset: euclaise/writingprompts
+  cache_path: data/raw/writingprompts.parquet
+  split: train
+  limit: null                # null = full ~300k; set 5000 for debug
+  force_download: false
+
+tokenizer:
+  name: hf
+  params:
+    model_id: NousResearch/Meta-Llama-3-8B
+    add_special_tokens: false
+
+passageize:
+  passage_tokens: 256        # REQUIRED. target tokens per passage
+  min_passage_tokens: 128    # drop tails shorter than this
+  out_path: data/passages/writingprompts.parquet
+
+split:
+  train_frac: 0.8
+  seed: 0
+
+pools:
+  primary:
+    n_passages: 20000
+    seed: 0
+    min_tokens: 64
+    max_tokens: 256
+    allow_short: false
+    out_path: data/pools/primary.parquet
+  ood:
+    n_passages: 2000
+    seed: 0
+    min_tokens: 64
+    max_tokens: 256
+    allow_short: false
+    out_path: data/pools/ood.parquet
