@@ -1,0 +1,7 @@
+pair,share_a,tasks_a,tasks_b,tasks_tie,sign_test_p
+random vs relevance,0.958,6,0,0,0.031
+random vs fps,1.0,6,0,0,0.031
+random vs iterative_pca,0.583,3,2,1,1.0
+relevance vs fps,0.5,1,1,4,1.0
+relevance vs iterative_pca,0.167,1,5,0,0.219
+fps vs iterative_pca,0.167,1,5,0,0.219

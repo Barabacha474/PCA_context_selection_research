@@ -14,16 +14,18 @@ Design
   as a floor.
 * Generation: the same model answers every (task, condition); output is
   a ~400-word piece. Temperature 0.7 (creative task), responses cached.
-* Judging (same model, blind to condition):
+* Judging (blind to condition; judge model/endpoint configurable via
+  ``--judge-model`` / ``--judge-base-url``, defaults to the generator):
   (A) pairwise preference for every pair of the four context methods,
       both presentation orders (controls position bias);
   (B) absolute 1-10 scores: idea_variety, originality, coherence,
       overall -- also for "none";
   (C) context utilisation: given the numbered context and the answer,
       list the passages the answer clearly draws on -> breadth of use.
-* Self-preference bias of an LLM judge affects all conditions equally
-  (every answer comes from the same generator), so it does not favour
-  any selection method; it is still a limitation (judge != human).
+* With a judge different from the generator there is no self-preference
+  bias; with the same model it would affect all conditions equally
+  (every answer comes from the same generator). Either way an LLM judge
+  is not a human.
 
 API: any OpenAI-compatible endpoint. Key from env ``LLM_API_KEY``,
 endpoint from ``--base-url``. Every call is cached under
@@ -93,16 +95,31 @@ JUDGE_SYSTEM = ("You are a strict, impartial editor evaluating creative writing 
 # ---------------------------------------------------------------------
 
 class LLM:
-    def __init__(self, base_url: str, model: str):
-        from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=os.environ["LLM_API_KEY"],
-                             timeout=300)
-        self.model = model
+    """Cached chat-completion client.
+
+    The client is created lazily, so a fully cached phase (e.g. the
+    generations, once done) never touches the network or needs a valid
+    key. ``temperature=None`` omits the field (some endpoints reject it).
+    The cache key includes the model name, so answers of different
+    models never collide.
+    """
+
+    def __init__(self, base_url: str, model: str, key_env: str = "LLM_API_KEY"):
+        self.base_url, self.model, self.key_env = base_url, model, key_env
+        self._client = None
         CACHE.mkdir(parents=True, exist_ok=True)
         self.usage = {"prompt": 0, "completion": 0, "calls": 0, "cached": 0}
 
+    @property
+    def client(self):
+        if self._client is None:
+            from openai import OpenAI
+            key = os.environ.get(self.key_env) or os.environ["LLM_API_KEY"]
+            self._client = OpenAI(base_url=self.base_url, api_key=key, timeout=300)
+        return self._client
+
     def __call__(self, system: str, user: str, max_tokens: int,
-                 temperature: float) -> str:
+                 temperature: float | None) -> str:
         payload = {"model": self.model, "system": system, "user": user,
                    "max_tokens": max_tokens, "temperature": temperature}
         key = hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -112,8 +129,9 @@ class LLM:
             return json.loads(path.read_text(encoding="utf-8"))["text"]
         for attempt in range(5):
             try:
+                extra = {} if temperature is None else {"temperature": temperature}
                 r = self.client.chat.completions.create(
-                    model=self.model, max_tokens=max_tokens, temperature=temperature,
+                    model=self.model, max_tokens=max_tokens, **extra,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": user}])
                 text = r.choices[0].message.content or ""
@@ -175,12 +193,24 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=8192)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--base-url", default="https://www.ai-funpay.ru/v1")
-    p.add_argument("--model", default="claude-opus-5-5")
+    p.add_argument("--model", default="claude-opus-5-5",
+                   help="generator model")
+    p.add_argument("--judge-base-url", default=None,
+                   help="judge endpoint (default: --base-url); key from "
+                        "env LLM_JUDGE_API_KEY, falling back to LLM_API_KEY")
+    p.add_argument("--judge-model", default=None,
+                   help="judge model (default: same as --model)")
+    p.add_argument("--judge-no-temperature", action="store_true",
+                   help="omit temperature in judge calls (endpoint rejects it)")
     p.add_argument("--workers", type=int, default=4)
     args = p.parse_args()
 
     OUT.mkdir(parents=True, exist_ok=True)
     llm = LLM(args.base_url, args.model)
+    args.judge_model = args.judge_model or args.model
+    judge = LLM(args.judge_base_url or args.base_url, args.judge_model,
+                key_env="LLM_JUDGE_API_KEY")
+    jt = None if args.judge_no_temperature else 0
     pool, ctx = build_contexts(args)
     conditions = list(METHODS) + ["none"]
 
@@ -211,7 +241,7 @@ def main() -> None:
                 "coherence (consistent, readable), overall (usefulness to a game "
                 'master). Return JSON: {"idea_variety": int, "originality": int, '
                 '"coherence": int, "overall": int}')
-        return job, parse_json(llm(JUDGE_SYSTEM, user, max_tokens=200, temperature=0))
+        return job, parse_json(judge(JUDGE_SYSTEM, user, max_tokens=200, temperature=jt))
 
     with ThreadPoolExecutor(args.workers) as ex:
         abs_scores = dict(ex.map(absolute, jobs))
@@ -228,7 +258,7 @@ def main() -> None:
                 "Which response gives a game master richer, more varied and more "
                 "original material while staying coherent? Return JSON: "
                 '{"winner": "A" | "B" | "tie", "reason": "<one sentence>"}')
-        out = parse_json(llm(JUDGE_SYSTEM, user, max_tokens=200, temperature=0))
+        out = parse_json(judge(JUDGE_SYSTEM, user, max_tokens=200, temperature=jt))
         w = str(out.get("winner", "tie")).strip().upper()
         winner = first if w == "A" else second if w == "B" else "tie"
         return {"task": task, "first": first, "second": second,
@@ -249,7 +279,7 @@ def main() -> None:
                 "character, setting, event or idea) is clearly reflected in the "
                 "response. Be conservative: do not count generic overlap. Return "
                 'JSON: {"used": [int, ...]}')
-        out = parse_json(llm(JUDGE_SYSTEM, user, max_tokens=300, temperature=0))
+        out = parse_json(judge(JUDGE_SYSTEM, user, max_tokens=300, temperature=jt))
         used = sorted({int(u) for u in out.get("used", [])
                        if 1 <= int(u) <= len(ctx[m])})
         return job, used
@@ -264,7 +294,7 @@ def main() -> None:
                "context_pool_indices": ctx.get(cond, []),
                "answer": answers[(task, cond)], "scores_llm_judge": sc,
                "context_used": util.get((task, cond)),
-               "judge_model": args.model, "generator_model": args.model}
+               "judge_model": args.judge_model, "generator_model": args.model}
         (OUT / f"{task}_{cond}.json").write_text(
             json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
         abs_rows.append({"task": task, "method": cond, **sc,
@@ -288,7 +318,7 @@ def main() -> None:
     pos_bias = (pairs["winner"] == pairs["first"]).mean()
 
     lines = ["# Downstream LLM evaluation (exp 3.3)\n",
-             f"Model (generator & judge): {args.model}; budget {args.budget}; "
+             f"Generator: {args.model}; judge: {args.judge_model}; budget {args.budget}; "
              f"seed {args.seed}; tasks {len(TASKS)}\n",
              "## Absolute scores (mean over tasks, 1-10)\n",
              absdf.groupby("method")[["idea_variety", "originality", "coherence",
@@ -299,7 +329,7 @@ def main() -> None:
              pd.DataFrame(head, index=["share_first", "n"]).T.round(3).to_markdown(),
              f"\nPosition bias: first-presented response wins {pos_bias:.2%} "
              "of pairwise judgements.\n",
-             f"\nAPI usage this run: {llm.usage}\n"]
+             f"\nAPI usage this run: generator {llm.usage}, judge {judge.usage}\n"]
     (OUT / "summary.md").write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 

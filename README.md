@@ -71,7 +71,7 @@ NOT SUBMITED YET
 | `docs/02_project.md` | Technical reference: architecture, contracts, how to extend (RU) |
 | `docs/03_experiments.md` | Planned experiments with priorities and recipes (RU) |
 | `docs/04_findings.md` | What's already established — read before running anything (RU) |
-| `docs/05_essential_results.md` | Essential experiments 3.1, 1.1, 1.2, 1.8, 3.4 (+ partial 3.3): results and artifacts (RU) |
+| `docs/05_essential_results.md` | Essential experiments 3.1, 1.1, 1.2, 1.8, 3.4 (+ 3.3 pilot): results and artifacts (RU) |
 
 **Read `docs/04_findings.md` before running experiments.** It lists what
 has already been done and what not to re-run.
