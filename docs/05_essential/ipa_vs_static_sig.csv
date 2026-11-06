@@ -1,0 +1,17 @@
+sweep,2048,4096,8192,16384,32768
+eval_bge_small,0,0,+,+,+
+eval_mpnet,-,0,+,+,+
+ood_200,+,+,+,+,+
+ood_2000,0,0,+,+,+
+randomized,0,0,+,+,+
+sel_bge_large,-,-,+,-,+
+sel_e5_large,-,+,+,+,+
+sel_minilm_l3,-,-,-,+,+
+sel_mpnet,0,+,+,+,+
+x_bge_large__bge_small,0,+,+,+,+
+x_bge_large__mpnet,0,+,+,+,+
+x_e5_large__bge_small,0,+,+,-,+
+x_e5_large__mpnet,-,+,0,-,+
+x_minilm_l3__bge_small,-,0,+,+,+
+x_minilm_l3__mpnet,-,0,0,-,0
+x_mpnet__bge_small,0,+,+,+,+

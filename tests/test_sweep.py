@@ -278,3 +278,65 @@ def test_selector_seed_in_params_is_stripped(sweep_cfg, two_encoders, caplog):
     results = pd.read_parquet(out["results_path"])
     # Still produces rows for both sweep seeds (0 and 1)
     assert sorted(results["seed"].unique()) == [0, 1]
+
+# ---- pass_anchor ---------------------------------------------------
+
+def test_pass_anchor_default_true_is_deterministic_across_seeds(
+    sweep_cfg, two_encoders
+):
+    # Default (no pass_anchor key): anchor is passed, FPS warm-up is the
+    # anchor argmax, so every seed yields the same selection.
+    sel, ev = two_encoders
+    out = run_sweep(sweep_cfg, sel_encoder_override=sel, eval_encoder_override=ev)
+    res = pd.read_parquet(out["results_path"])
+    fps = res[res["method"] == "fps"]
+    for _, g in fps.groupby("target_budget"):
+        assert g["vendi_score"].nunique() == 1
+
+
+def test_pass_anchor_false_gives_seed_variance(sweep_cfg, two_encoders):
+    sel, ev = two_encoders
+    sweep_cfg["selectors"] = [
+        {"name": "random", "params": {}},
+        {"name": "fps", "params": {"metric": "euclidean"}, "pass_anchor": False},
+    ]
+    sweep_cfg["seeds"] = [0, 1, 2, 3]
+    out = run_sweep(sweep_cfg, sel_encoder_override=sel, eval_encoder_override=ev)
+    res = pd.read_parquet(out["results_path"])
+    fps = res[res["method"] == "fps"]
+    # Seeded random warm-up -> at least one budget differs across seeds.
+    assert any(
+        g["vendi_score"].nunique() > 1
+        for _, g in fps.groupby("target_budget")
+    )
+
+
+def test_pass_anchor_false_on_relevance_raises(sweep_cfg, two_encoders):
+    sel, ev = two_encoders
+    sweep_cfg["selectors"] = [
+        {"name": "relevance", "params": {}, "pass_anchor": False},
+    ]
+    with pytest.raises(ValueError, match="requires core_emb"):
+        run_sweep(sweep_cfg, sel_encoder_override=sel, eval_encoder_override=ev)
+
+
+def test_pass_anchor_non_bool_raises(sweep_cfg, two_encoders):
+    sel, ev = two_encoders
+    sweep_cfg["selectors"] = [
+        {"name": "fps", "params": {}, "pass_anchor": "no"},
+    ]
+    with pytest.raises(ValueError, match="pass_anchor must be a bool"):
+        run_sweep(sweep_cfg, sel_encoder_override=sel, eval_encoder_override=ev)
+
+
+def test_pass_anchor_recorded_in_meta(sweep_cfg, two_encoders):
+    sel, ev = two_encoders
+    sweep_cfg["selectors"] = [
+        {"name": "random", "params": {}},
+        {"name": "fps", "params": {"metric": "euclidean"}, "pass_anchor": False},
+    ]
+    out = run_sweep(sweep_cfg, sel_encoder_override=sel, eval_encoder_override=ev)
+    meta = json.loads(Path(out["meta_path"]).read_text(encoding="utf-8"))
+    specs = {s["name"]: s for s in meta["selector_specs"]}
+    assert specs["random"]["pass_anchor"] is True
+    assert specs["fps"]["pass_anchor"] is False

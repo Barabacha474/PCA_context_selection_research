@@ -1,0 +1,5 @@
+# Exp 1.1 selection encoder (1024-d). bge is trained with CLS pooling -> hf_cls.
+name: hf_cls
+model_id: BAAI/bge-large-en-v1.5
+device: auto
+normalize: true

@@ -36,7 +36,10 @@ Centrality anchor
 pool in **selection** embedding space (see
 :func:`pcadiv.data.pools.compute_pool_centroid`). This is the anchor for
 the relevance baseline and for the relevance term of MMR in the primary
-sweep. Metrics receive ``core_emb=None`` -- current metrics are
+sweep. A selector spec may set ``pass_anchor: false`` to withhold the
+anchor (``core_emb=None``); deterministic selectors then warm up from
+their seeded anchor-free mode, which is what produces a non-degenerate
+bootstrap CI across seeds. Metrics receive ``core_emb=None`` -- current metrics are
 anchor-free, and future anchor-aware metrics will be wired in when they
 exist.
 """
@@ -169,9 +172,23 @@ def run_sweep(
     core_emb = compute_pool_centroid(sel_emb, normalize=True)
 
     # ---- instantiate selectors and metrics -------------------------
-    selector_specs = []
+    # Each spec is (name, params, pass_anchor). ``pass_anchor`` defaults
+    # to True (backward compatible: every pre-existing config passed the
+    # pool centroid to every selector). With ``pass_anchor: false`` the
+    # selector receives ``core_emb=None`` and its warm-up falls back to
+    # its anchor-free mode (seeded random / norm) -- this is what gives
+    # deterministic selectors (fps, iterative_pca, mmr_dynamic) a real
+    # variance across seeds. Selectors that require an anchor
+    # (relevance, mmr with lambda_>0) raise ValueError if it is withheld.
+    selector_specs: list[tuple[str, dict, bool]] = []
     for s in cfg["selectors"]:
         params = dict(s.get("params", {}))
+        pass_anchor = s.get("pass_anchor", True)
+        if not isinstance(pass_anchor, bool):
+            raise ValueError(
+                f"selector {s['name']!r}: pass_anchor must be a bool, "
+                f"got {pass_anchor!r}"
+            )
         if "seed" in params:
             # 'seed' is controlled by the sweep loop (cfg['seeds']); a
             # per-selector seed in params is a config bug -- silently
@@ -182,7 +199,7 @@ def run_sweep(
                 s["name"],
             )
             params.pop("seed")
-        selector_specs.append((s["name"], params))
+        selector_specs.append((s["name"], params, pass_anchor))
     metrics = [
         get_metric(m["name"], **m.get("params", {}))
         for m in cfg["metrics"]
@@ -210,12 +227,13 @@ def run_sweep(
     n_total = len(selector_specs) * len(seeds) * len(budgets)
     n_done = 0
     t_sweep = time.perf_counter()
-    for sel_name, sel_params in selector_specs:
+    for sel_name, sel_params, pass_anchor in selector_specs:
+        anchor = core_emb if pass_anchor else None
         for seed in seeds:
             for budget in budgets:
                 selector = get_selector(sel_name, seed=seed, **sel_params)
                 res = selector.select(
-                    sel_emb, pool_tokens, budget=budget, core_emb=core_emb,
+                    sel_emb, pool_tokens, budget=budget, core_emb=anchor,
                 )
                 sel_eval = (
                     eval_emb[res.indices] if len(res) > 0 else eval_emb[:0]
@@ -291,6 +309,10 @@ def run_sweep(
             "fingerprint": eval_enc.fingerprint(),
         },
         "selectors": [s[0] for s in selector_specs],
+        "selector_specs": [
+            {"name": n, "params": p, "pass_anchor": a}
+            for n, p, a in selector_specs
+        ],
         "budgets": budgets,
         "seeds": seeds,
         "metric_keys": metric_keys,
