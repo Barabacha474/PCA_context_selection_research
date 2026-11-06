@@ -11,6 +11,8 @@
 **3.4** (qualitative check), **3.3** (downstream с LLM, в формате пилота —
 см. раздел 7).
 
+![Vendi vs бюджет, все методы, 95% CI](05_essential/vendi_vs_budget.png)
+
 ![Δ Vendi (iterative PCA − FPS), % от FPS, 95% bootstrap CI](05_essential/essential_delta_vendi.png)
 
 ---
