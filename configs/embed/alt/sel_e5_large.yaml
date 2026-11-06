@@ -1,0 +1,5 @@
+# Exp 1.1 selection encoder (1024-d, mean pooling). LIMITATION: e5 expects a 'passage: ' prefix, which the encoder family does not add.
+name: hf_mean
+model_id: intfloat/e5-large-v2
+device: auto
+normalize: true

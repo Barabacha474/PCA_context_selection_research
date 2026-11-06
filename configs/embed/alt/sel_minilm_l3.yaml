@@ -1,0 +1,5 @@
+# Exp 1.1 selection encoder (384-d, mean pooling).
+name: hf_mean
+model_id: sentence-transformers/paraphrase-MiniLM-L3-v2
+device: auto
+normalize: true

@@ -1,0 +1,60 @@
+# Experiment 3.1 (randomized warm-up) and the base config for every
+# essential robustness sweep (1.1 selection encoders, 1.2 eval encoders,
+# 1.8 OOD). Differs from main_sweep.yaml (= the debug_wide setup) only in:
+#   * pass_anchor: false for every selector that does not need an anchor,
+#     so fps / iterative_pca / mmr_dynamic warm up from a seeded random
+#     point and seeds produce real variance (bootstrap CI not [x, x]);
+#   * 10 seeds instead of 5;
+#   * reference_method: fps -- the comparison of interest is ipa vs fps.
+# With the same seed, fps / iterative_pca / mmr_dynamic start from the
+# SAME random point (make_rng(seed).permutation), so the paired delta
+# vs fps is a genuinely paired comparison.
+# relevance and mmr (lambda_>0) require an anchor by contract and remain
+# deterministic; static_pca has no warm-up and is deterministic too.
+reference_method: fps
+
+data:
+  pool_path: data/pools/primary.parquet
+  ood_pool_path: data/pools/ood.parquet
+  cache_dir: data/embeddings
+
+encoders:
+  selection: configs/embed/selection_encoder.yaml
+  eval: configs/embed/eval_encoder.yaml
+
+selectors:
+  - name: random
+    params: {}
+    pass_anchor: false
+  - name: relevance
+    params: {}
+    pass_anchor: true
+  - name: mmr
+    params: {lambda_: 0.7}
+    pass_anchor: true
+  - name: mmr_dynamic
+    params: {lambda_: 0.7}
+    pass_anchor: false
+  - name: fps
+    params: {metric: euclidean}
+    pass_anchor: false
+  - name: static_pca
+    params: {k: 5}
+    pass_anchor: false
+  - name: iterative_pca
+    params: {k: 5, warmup: random}
+    pass_anchor: false
+
+budgets: [2048, 4096, 8192, 16384, 32768]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+metrics:
+  - name: mean_pairwise
+    params: {}
+  - name: coverage
+    params: {}
+  - name: vendi
+    params: {gamma: 1.0}
+
+output_dir: results/metrics
+sweep_name: randomized
