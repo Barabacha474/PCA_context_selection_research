@@ -7,11 +7,15 @@ as a novelty measure for selecting semantically diverse context for LLMs.
 
 ## Key finding so far
 
-Iterative PCA beats Farthest Point Sampling on diversity metrics (Vendi
-Score, coverage radius) at token budgets >= 8192, while selecting 60-65%
-different passages. Below 8192 tokens the two methods are mathematically
-equivalent on standard embedding spaces. See `docs/04_findings.md` for
-details.
+Iterative PCA beats Farthest Point Sampling on Vendi Score at token
+budgets >= 8192, while selecting 60-65% different passages. With a
+randomized warm-up (10 seeds) the advantage is statistically significant
+(bootstrap CI excludes 0) and holds across 5 selection encoders x 3 eval
+encoders, on held-out (OOD) stories and on an artifact-filtered pool;
+the effect size is modest (typically +2..+5% Vendi at 32k). The earlier
+coverage-radius advantage does not survive these checks. Below ~8192
+tokens the methods are near-equivalent; the exact threshold depends on
+the encoder. See `docs/04_findings.md` and `docs/05_essential_results.md`.
 
 ## Quick install
 
@@ -67,6 +71,7 @@ NOT SUBMITED YET
 | `docs/02_project.md` | Technical reference: architecture, contracts, how to extend (RU) |
 | `docs/03_experiments.md` | Planned experiments with priorities and recipes (RU) |
 | `docs/04_findings.md` | What's already established — read before running anything (RU) |
+| `docs/05_essential_results.md` | Essential experiments 3.1, 1.1, 1.2, 1.8, 3.4 (+ partial 3.3): results and artifacts (RU) |
 
 **Read `docs/04_findings.md` before running experiments.** It lists what
 has already been done and what not to re-run.
